@@ -22,7 +22,6 @@ import (
 )
 
 func TestGet(t *testing.T) {
-	defer ResetForTest(nil)
 	defaultCap := Capabilities{
 		AllowPrivileged: false,
 		PrivilegedSources: PrivilegedSources{
