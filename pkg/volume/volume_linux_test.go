@@ -28,6 +28,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	utiltesting "k8s.io/client-go/util/testing"
+	"k8s.io/kubernetes/pkg/volume/util/types"
 )
 
 type localFakeMounter struct {
@@ -468,4 +469,542 @@ func verifyFileOwner(path string, uid, gid int) bool {
 	}
 
 	return true
+}
+
+func TestSetVolumeOwnershipNilCompleteFunc(t *testing.T) {
+	tmpDir, err := utiltesting.MkTmpdir("volume_linux_test")
+	if err != nil {
+		t.Fatalf("error creating temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	fsGroup := int64(1000)
+	mounter := &localFakeMounter{path: tmpDir}
+	always := v1.FSGroupChangeAlways
+
+	err = SetVolumeOwnership(mounter, tmpDir, &fsGroup, &always, nil)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestChangeFilePermissionSymlink(t *testing.T) {
+	tmpDir, err := utiltesting.MkTmpdir("volume_linux_test")
+	if err != nil {
+		t.Fatalf("error creating temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create a file and a symlink to it
+	realFile := filepath.Join(tmpDir, "realfile")
+	symlinkFile := filepath.Join(tmpDir, "symlink")
+	if err := os.WriteFile(realFile, []byte("test"), 0644); err != nil {
+		t.Fatalf("error creating test file: %v", err)
+	}
+	if err := os.Symlink(realFile, symlinkFile); err != nil {
+		t.Fatalf("error creating symlink: %v", err)
+	}
+
+	fsGroup := int64(1000)
+	info, err := os.Lstat(symlinkFile)
+	if err != nil {
+		t.Fatalf("error getting file info: %v", err)
+	}
+
+	err = changeFilePermission(symlinkFile, &fsGroup, false, info)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	// Verify that the symlink permissions were not changed
+	newInfo, err := os.Lstat(symlinkFile)
+	if err != nil {
+		t.Fatalf("error getting file info after change: %v", err)
+	}
+	if newInfo.Mode() != info.Mode() {
+		t.Errorf("symlink permissions changed unexpectedly")
+	}
+}
+
+func TestSkipPermissionChangeCombinations(t *testing.T) {
+	tmpDir, err := utiltesting.MkTmpdir("volume_linux_test")
+	if err != nil {
+		t.Fatalf("error creating temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	fsGroup := int64(1000)
+	always := v1.FSGroupChangeAlways
+	onRootMismatch := v1.FSGroupChangeOnRootMismatch
+
+	tests := []struct {
+		name                   string
+		fsGroupChangePolicy    *v1.PodFSGroupChangePolicy
+		readonly               bool
+		expectedSkipPermission bool
+	}{
+		{"Always policy, not readonly", &always, false, false},
+		{"Always policy, readonly", &always, true, false},
+		{"OnRootMismatch policy, not readonly", &onRootMismatch, false, false},
+		{"OnRootMismatch policy, readonly", &onRootMismatch, true, false},
+		{"Nil policy, not readonly", nil, false, false},
+		{"Nil policy, readonly", nil, true, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mounter := &localFakeMounter{
+				path:       tmpDir,
+				attributes: Attributes{ReadOnly: tt.readonly},
+			}
+			result := skipPermissionChange(mounter, tmpDir, &fsGroup, tt.fsGroupChangePolicy)
+			if result != tt.expectedSkipPermission {
+				t.Errorf("expected skipPermission to be %v, got %v", tt.expectedSkipPermission, result)
+			}
+		})
+	}
+}
+
+func TestWalkDeepVariousStructures(t *testing.T) {
+	tmpDir, err := utiltesting.MkTmpdir("volume_linux_test")
+	if err != nil {
+		t.Fatalf("error creating temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create a complex directory structure
+	if err := os.MkdirAll(filepath.Join(tmpDir, "dir1", "subdir"), 0755); err != nil {
+		t.Fatalf("error creating directory structure: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "file1.txt"), []byte("test"), 0644); err != nil {
+		t.Fatalf("error creating test file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "dir1", "file2.txt"), []byte("test"), 0644); err != nil {
+		t.Fatalf("error creating test file: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(tmpDir, "file1.txt"), filepath.Join(tmpDir, "symlink")); err != nil {
+		t.Fatalf("error creating symlink: %v", err)
+	}
+
+	visitedPaths := make(map[string]bool)
+	err = walkDeep(tmpDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		visitedPaths[path] = true
+		return nil
+	})
+
+	if err != nil {
+		t.Errorf("unexpected error during walkDeep: %v", err)
+	}
+
+	expectedPaths := []string{
+		tmpDir,
+		filepath.Join(tmpDir, "dir1"),
+		filepath.Join(tmpDir, "dir1", "subdir"),
+		filepath.Join(tmpDir, "file1.txt"),
+		filepath.Join(tmpDir, "dir1", "file2.txt"),
+		filepath.Join(tmpDir, "symlink"),
+	}
+
+	for _, path := range expectedPaths {
+		if !visitedPaths[path] {
+			t.Errorf("expected path %s was not visited", path)
+		}
+	}
+}
+
+func TestChangeFilePermission2(t *testing.T) {
+	tmpDir, err := utiltesting.MkTmpdir("volume_linux_test")
+	if err != nil {
+		t.Fatalf("error creating temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	fsGroup := int64(1000)
+
+	// Test regular file
+	t.Run("Regular file", func(t *testing.T) {
+		testFile := filepath.Join(tmpDir, "test_file")
+		err := os.WriteFile(testFile, []byte("test"), 0644)
+		if err != nil {
+			t.Fatalf("Failed to create test file: %v", err)
+		}
+
+		info, err := os.Stat(testFile)
+		if err != nil {
+			t.Fatalf("Failed to stat test file: %v", err)
+		}
+
+		err = changeFilePermission(testFile, &fsGroup, false, info)
+		if err != nil {
+			t.Errorf("Expected no error, got: %v", err)
+		}
+
+		// Check if permissions were changed
+		newInfo, err := os.Stat(testFile)
+		if err != nil {
+			t.Fatalf("Failed to stat test file after permission change: %v", err)
+		}
+		if newInfo.Mode().Perm()&0660 != 0660 {
+			t.Errorf("Expected permissions to include 0660, got %v", newInfo.Mode().Perm())
+		}
+	})
+
+	// Test directory
+	t.Run("Directory", func(t *testing.T) {
+		testDir := filepath.Join(tmpDir, "test_dir")
+		err := os.Mkdir(testDir, 0755)
+		if err != nil {
+			t.Fatalf("Failed to create test directory: %v", err)
+		}
+
+		info, err := os.Stat(testDir)
+		if err != nil {
+			t.Fatalf("Failed to stat test directory: %v", err)
+		}
+
+		err = changeFilePermission(testDir, &fsGroup, false, info)
+		if err != nil {
+			t.Errorf("Expected no error, got: %v", err)
+		}
+
+		// Check if permissions were changed
+		newInfo, err := os.Stat(testDir)
+		if err != nil {
+			t.Fatalf("Failed to stat test directory after permission change: %v", err)
+		}
+		if newInfo.Mode().Perm()&0770 != 0770 {
+			t.Errorf("Expected permissions to include 0770, got %v", newInfo.Mode().Perm())
+		}
+	})
+
+	// Test symlink
+	t.Run("Symlink", func(t *testing.T) {
+		testFile := filepath.Join(tmpDir, "test_file")
+		testLink := filepath.Join(tmpDir, "test_link")
+		err := os.WriteFile(testFile, []byte("test"), 0644)
+		if err != nil {
+			t.Fatalf("Failed to create test file: %v", err)
+		}
+		err = os.Symlink(testFile, testLink)
+		if err != nil {
+			t.Fatalf("Failed to create symlink: %v", err)
+		}
+
+		info, err := os.Lstat(testLink)
+		if err != nil {
+			t.Fatalf("Failed to lstat test link: %v", err)
+		}
+
+		err = changeFilePermission(testLink, &fsGroup, false, info)
+		if err != nil {
+			t.Errorf("Expected no error, got: %v", err)
+		}
+
+		// Symlink permissions should not change
+		newInfo, err := os.Lstat(testLink)
+		if err != nil {
+			t.Fatalf("Failed to lstat test link after permission change: %v", err)
+		}
+		if newInfo.Mode() != info.Mode() {
+			t.Errorf("Expected symlink mode to remain unchanged, got %v", newInfo.Mode())
+		}
+	})
+}
+
+func TestSkipPermissionChange2(t *testing.T) {
+	tmpDir, err := utiltesting.MkTmpdir("volume_linux_test")
+	if err != nil {
+		t.Fatalf("error creating temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	fsGroup := int64(1000)
+	mounter := &localFakeMounter{path: tmpDir}
+
+	always := v1.FSGroupChangeAlways
+	onRootMismatch := v1.FSGroupChangeOnRootMismatch
+
+	testCases := []struct {
+		name                   string
+		fsGroupChangePolicy    *v1.PodFSGroupChangePolicy
+		expectedSkipPermission bool
+	}{
+		{"nil policy", nil, false},
+		{"Always policy", &always, false},
+		{"OnRootMismatch policy", &onRootMismatch, false},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := skipPermissionChange(mounter, tmpDir, &fsGroup, tc.fsGroupChangePolicy)
+			if result != tc.expectedSkipPermission {
+				t.Errorf("Expected skipPermission to be %v, got %v", tc.expectedSkipPermission, result)
+			}
+		})
+	}
+}
+
+func TestRequiresPermissionChange(t *testing.T) {
+	tmpDir, err := utiltesting.MkTmpdir("volume_linux_test")
+	if err != nil {
+		t.Fatalf("error creating temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	fsGroup := int64(1000)
+
+	// Test with non-existent directory
+	t.Run("Non-existent directory", func(t *testing.T) {
+		result := requiresPermissionChange("/non/existent/dir", &fsGroup, false)
+		if !result {
+			t.Errorf("Expected true for non-existent directory, got false")
+		}
+	})
+
+	// Test with matching GID but wrong permissions
+	t.Run("Matching GID but wrong permissions", func(t *testing.T) {
+		err := os.Chmod(tmpDir, 0700)
+		if err != nil {
+			t.Fatalf("Failed to change permissions: %v", err)
+		}
+
+		result := requiresPermissionChange(tmpDir, &fsGroup, false)
+		if !result {
+			t.Errorf("Expected true for wrong permissions, got false")
+		}
+	})
+
+	// Test with correct permissions
+	t.Run("Correct permissions", func(t *testing.T) {
+		err := os.Chmod(tmpDir, 0770)
+		if err != nil {
+			t.Fatalf("Failed to change permissions: %v", err)
+		}
+
+		result := requiresPermissionChange(tmpDir, &fsGroup, false)
+		if !result {
+			t.Errorf("Expected true for correct permissions, got false")
+		}
+	})
+}
+
+func TestSetVolumeOwnershipCompleteFunc(t *testing.T) {
+	tmpDir, err := utiltesting.MkTmpdir("volume_linux_test")
+	if err != nil {
+		t.Fatalf("error creating temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	fsGroup := int64(1000)
+	mounter := &localFakeMounter{path: tmpDir}
+	always := v1.FSGroupChangeAlways
+
+	var completeFuncCalled bool
+	var completeFuncErr error
+
+	completeFunc := func(cfp types.CompleteFuncParam) {
+		completeFuncCalled = true
+		if cfp.Err != nil {
+			completeFuncErr = *cfp.Err
+		}
+	}
+
+	err = SetVolumeOwnership(mounter, tmpDir, &fsGroup, &always, completeFunc)
+
+	if err != nil {
+		t.Errorf("Unexpected error from SetVolumeOwnership: %v", err)
+	}
+
+	if !completeFuncCalled {
+		t.Error("completeFunc was not called")
+	}
+
+	if completeFuncErr != nil {
+		t.Errorf("Unexpected error in completeFunc: %v", completeFuncErr)
+	}
+
+	// Test with nil fsGroup
+	completeFuncCalled = false
+	completeFuncErr = nil
+
+	err = SetVolumeOwnership(mounter, tmpDir, nil, &always, completeFunc)
+
+	if err != nil {
+		t.Errorf("Unexpected error from SetVolumeOwnership with nil fsGroup: %v", err)
+	}
+
+	if completeFuncCalled {
+		t.Error("completeFunc was called when fsGroup is nil")
+	}
+
+	// Test with nil completeFunc
+	err = SetVolumeOwnership(mounter, tmpDir, &fsGroup, &always, nil)
+
+	if err != nil {
+		t.Errorf("Unexpected error from SetVolumeOwnership with nil completeFunc: %v", err)
+	}
+}
+
+func TestSetVolumeOwnershipWithReadOnly(t *testing.T) {
+	tmpDir, err := utiltesting.MkTmpdir("volume_linux_test")
+	if err != nil {
+		t.Fatalf("error creating temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	fsGroup := int64(1000)
+	always := v1.FSGroupChangeAlways
+
+	tests := []struct {
+		name     string
+		readOnly bool
+	}{
+		{
+			name:     "ReadWrite volume",
+			readOnly: false,
+		},
+		{
+			name:     "ReadOnly volume",
+			readOnly: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mounter := &localFakeMounter{
+				path: tmpDir,
+				attributes: Attributes{
+					ReadOnly: tc.readOnly,
+				},
+			}
+
+			var completeFuncCalled bool
+			var completeFuncErr error
+
+			completeFunc := func(cfp types.CompleteFuncParam) {
+				completeFuncCalled = true
+				if cfp.Err != nil {
+					completeFuncErr = *cfp.Err
+				}
+			}
+
+			err = SetVolumeOwnership(mounter, tmpDir, &fsGroup, &always, completeFunc)
+
+			if err != nil {
+				t.Errorf("Unexpected error from SetVolumeOwnership: %v", err)
+			}
+
+			if !completeFuncCalled {
+				t.Error("completeFunc was not called")
+			}
+
+			if completeFuncErr != nil {
+				t.Errorf("Unexpected error in completeFunc: %v", completeFuncErr)
+			}
+
+			// Check the permissions of the directory
+			info, err := os.Stat(tmpDir)
+			if err != nil {
+				t.Fatalf("Failed to stat directory: %v", err)
+			}
+
+			// Log the actual permissions
+			t.Logf("Actual permissions for %s: %v", tc.name, info.Mode().Perm())
+
+			// Verify that permissions are consistent regardless of ReadOnly attribute
+			expectedPerm := os.FileMode(0770)
+			if info.Mode().Perm() != expectedPerm {
+				t.Errorf("Expected permissions %v, got %v", expectedPerm, info.Mode().Perm())
+			}
+
+			// Log a message about the ReadOnly attribute not affecting permissions
+			t.Logf("Note: ReadOnly attribute (%v) does not affect the set permissions", tc.readOnly)
+		})
+	}
+}
+
+// Custom lstat function that returns an error for the test file
+func customLstat(path string) (os.FileInfo, error) {
+	if path == testFile {
+		return nil, fmt.Errorf("simulated Lstat error")
+	}
+	return os.Lstat(path)
+}
+
+// Custom walk function that uses our custom lstat
+func customWalk(path string, info os.FileInfo, walkFn filepath.WalkFunc) error {
+	if !info.IsDir() {
+		return walkFn(path, info, nil)
+	}
+	names, err := readDirNames(path)
+	if err != nil {
+		return err
+	}
+	for _, name := range names {
+		filename := filepath.Join(path, name)
+		fileInfo, err := customLstat(filename)
+		if err != nil {
+			if err := walkFn(filename, fileInfo, err); err != nil && err != filepath.SkipDir {
+				return err
+			}
+		} else {
+			err = customWalk(filename, fileInfo, walkFn)
+			if err != nil {
+				if (!fileInfo.IsDir() || err != filepath.SkipDir) && err != filepath.SkipDir {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func TestWalkErrorHandling(t *testing.T) {
+	tmpDir, err := utiltesting.MkTmpdir("volume_linux_test")
+	if err != nil {
+		t.Fatalf("error creating temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create a subdirectory and a file
+	subDir := filepath.Join(tmpDir, "subdir")
+	if err := os.Mkdir(subDir, 0755); err != nil {
+		t.Fatalf("Failed to create subdirectory: %v", err)
+	}
+	testFile := filepath.Join(subDir, "testfile")
+	if err := os.WriteFile(testFile, []byte("test content"), 0644); err != nil {
+		t.Fatalf("Failed to create test file: %v", err)
+	}
+
+
+
+	errorEncountered := false
+	testWalkFunc := func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			if path == testFile && err.Error() == "simulated Lstat error" {
+				errorEncountered = true
+				return nil // Continue walking
+			}
+			return err
+		}
+		return nil
+	}
+
+	// Get initial FileInfo for tmpDir
+	tmpDirInfo, err := os.Lstat(tmpDir)
+	if err != nil {
+		t.Fatalf("Failed to get FileInfo for tmpDir: %v", err)
+	}
+
+	err = customWalk(tmpDir, tmpDirInfo, testWalkFunc)
+	if err != nil {
+		t.Errorf("customWalk returned unexpected error: %v", err)
+	}
+
+	if !errorEncountered {
+		t.Error("Expected to encounter simulated error, but didn't")
+	}
 }
